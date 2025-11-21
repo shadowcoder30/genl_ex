@@ -13,7 +13,7 @@
 
 static char message[GENL_TEST_ATTR_MSG_MAX];
 static int send_to_kernel;
-static unsigned int mcgroups;		/* Mask of groups */
+static unsigned char mcgroups[GENL_TEST_TOTAL_GROUPS];	/* Array of group flags */
 
 static void usage(char* name)
 {
@@ -30,13 +30,13 @@ static void add_group(char* group)
 {
 	unsigned int grp = strtoul(group, NULL, 10);
 
-	if (grp > GENL_TEST_MCGRP_MAX-1) {
+	if (grp >= GENL_TEST_TOTAL_GROUPS) {
 		fprintf(stderr, "Invalid group number %u. Values allowed 0:%u\n",
-			grp, GENL_TEST_MCGRP_MAX-1);
+			grp, GENL_TEST_TOTAL_GROUPS - 1);
 		exit(EXIT_FAILURE);
 	}
 
-	mcgroups |= 1 << (grp);
+	mcgroups[grp] = 1;
 }
 
 static void parse_cmd_line(int argc, char** argv)
@@ -79,12 +79,21 @@ static void parse_cmd_line(int argc, char** argv)
 	}
 
 	/* sanity checks */
-	if (send_to_kernel && mcgroups)  {
+	/* Check if any groups are set */
+	int has_groups = 0;
+	for (unsigned int i = 0; i < GENL_TEST_TOTAL_GROUPS; i++) {
+		if (mcgroups[i]) {
+			has_groups = 1;
+			break;
+		}
+	}
+
+	if (send_to_kernel && has_groups)  {
 		fprintf(stderr, "I can either receive or send messages.\n\n");
 		usage(argv[0]);
 		exit(EXIT_FAILURE);
 	}	
-	if (!send_to_kernel && !mcgroups)  {
+	if (!send_to_kernel && !has_groups)  {
 		fprintf(stderr, "Nothing to do!\n");
 		usage(argv[0]);
 		exit(EXIT_SUCCESS);
@@ -99,10 +108,11 @@ static int send_msg_to_kernel(struct nl_sock *sock)
 {
 	struct nl_msg* msg;
 	int family_id, err = 0;
+	const char* family_name = genl_test_get_family_name(0); /* Use first family for sending */
 
-	family_id = genl_ctrl_resolve(sock, GENL_TEST_FAMILY_NAME);
+	family_id = genl_ctrl_resolve(sock, family_name);
 	if(family_id < 0){
-		fprintf(stderr, "Unable to resolve family name!\n");
+		fprintf(stderr, "Unable to resolve family name %s!\n", family_name);
 		exit(EXIT_FAILURE);
 	}
 
@@ -161,7 +171,6 @@ static int print_rx_msg(struct nl_msg *msg, void* arg)
 static void prep_nl_sock(struct nl_sock** nlsock)
 {
 	int family_id, grp_id;
-	unsigned int bit = 0;
 	
 	*nlsock = nl_socket_alloc();
 	if(!*nlsock) {
@@ -179,35 +188,44 @@ static void prep_nl_sock(struct nl_sock** nlsock)
 		goto exit_err;
 	}
 
-	/* resolve the generic nl family id*/
-	family_id = genl_ctrl_resolve(*nlsock, GENL_TEST_FAMILY_NAME);
-	if(family_id < 0){
-		fprintf(stderr, "Unable to resolve family name!\n");
-		goto exit_err;
+	/* Check if any groups are set */
+	int has_groups = 0;
+	for (unsigned int i = 0; i < GENL_TEST_TOTAL_GROUPS; i++) {
+		if (mcgroups[i])
+			has_groups = 1;
 	}
-
-	if (!mcgroups)
+	if (!has_groups)
 		return;
 
-	while (bit < sizeof(unsigned int)) {
-		if (!(mcgroups & (1 << bit)))
-			goto next;
+	/* Join all requested groups */
+	for (unsigned int global_grp = 0; global_grp < GENL_TEST_TOTAL_GROUPS; global_grp++) {
+		if (!mcgroups[global_grp])
+			continue;
 
-		grp_id = genl_ctrl_resolve_grp(*nlsock, GENL_TEST_FAMILY_NAME,
-				genl_test_mcgrp_names[bit]);
+		unsigned int family_idx = GENL_TEST_GET_FAMILY_IDX(global_grp);
+		unsigned int local_grp = GENL_TEST_GET_LOCAL_GRP(global_grp);
+		const char* family_name = genl_test_get_family_name(family_idx);
+		const char* group_name = genl_test_get_group_name(local_grp);
 
+		/* Resolve family if not already resolved for this family */
+		family_id = genl_ctrl_resolve(*nlsock, family_name);
+		if(family_id < 0){
+			fprintf(stderr, "Unable to resolve family name %s for group %u!\n",
+				family_name, global_grp);
+			goto exit_err;
+		}
+
+		grp_id = genl_ctrl_resolve_grp(*nlsock, family_name, group_name);
 		if (grp_id < 0)	{
-			fprintf(stderr, "Unable to resolve group name for %u!\n",
-				(1 << bit));
-            goto exit_err;
+			fprintf(stderr, "Unable to resolve group name %s (global group %u)!\n",
+				group_name, global_grp);
+			goto exit_err;
 		}
 		if (nl_socket_add_membership(*nlsock, grp_id)) {
-			fprintf(stderr, "Unable to join group %u!\n", 
-				(1 << bit));
-            goto exit_err;
+			fprintf(stderr, "Unable to join group %u (family %s, group %s)!\n",
+				global_grp, family_name, group_name);
+			goto exit_err;
 		}
-next:
-		bit++;
 	}
 
     return;
